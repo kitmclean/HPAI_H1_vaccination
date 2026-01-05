@@ -38,7 +38,7 @@ library(grid)
 PopSize   <- 10000
 CowPop    <- 280000 
 
-H5_cow_prev_peak <- 0.40   # peak fraction of herd infected
+H5_cow_prev_peak <- 0.50   # peak fraction of herd infected
 InfCowPop_peak   <- CowPop * H5_cow_prev_peak
 
 # Time-varying H5 prevalence in cattle: simple Gaussian epidemic
@@ -204,9 +204,9 @@ SLIR_two_virus_vax <- function(t, x, params) {
 x0 <- numeric(35)
 
 # Set initial conditions
-x0[1] <- PopSize - 10   # S1S5: fully susceptible, unvaccinated
-x0[3] <- 9              # I1S5: infected with H1 only
-x0[10] <- 1             # S1I5: infected with H5 only
+x0[1] <- PopSize - 7   # S1S5: fully susceptible, unvaccinated
+x0[3] <- 3              # I1S5: infected with H1 only
+x0[10] <- 0             # S1I5: infected with H5 only
 
 # State variable names
 names(x0) <- c("S1S5","L1S5","I1S5","R1S5","R1L5","R1I5",
@@ -543,10 +543,103 @@ saveRDS(list(
   nu_range = c(nu_min_lhs, nu_max_lhs)
 ), "calibrated_parameters.rds")
 
+###############################################################################
+# 7. Visualizing the relationships between H1 infection, coinfection, and 
+#    vaccination coverage in s few different ways
+#
+#
+###############################################################################
+
+#Vax coverage targets
+
+targets <- c(5, 20, 50, 80)
+
+# Find the actual vax_coverage values in your data that are closest to each target & the associated nu values
+closest_vax <- peak_cumulative %>%
+  distinct(vax_coverage, nu) %>%                 # keep nu attached
+  tidyr::expand_grid(target = targets) %>%
+  mutate(diff = abs(vax_coverage - target)) %>%
+  group_by(target) %>%
+  slice_min(diff, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(target) %>%
+  dplyr::select(target, vax_coverage, nu, diff)
+
+closest_vax
+
+# gives the *actual* vax_coverage values used for panels
+
+# Now filter the full data to only those chosen coverages by the nu value
+nu_sel <- nu_sim_data %>%
+  semi_join(closest_vax, by = "nu")  %>%
+  mutate(
+    # order panels by increasing nu (low -> high)
+    nu_fct = factor(nu, levels = sort(unique(nu)))
+  )
+
+
+# Dark-to-light reds (low nu darkest, high nu lightest)
+reds <- c("#4B0000", "#7A1A1A", "#A64A4A", "#D08A8A")
+pal_nu <- setNames(reds[seq_along(levels(nu_sel$nu_fct))], levels(nu_sel$nu_fct))
+
+ggplot(nu_sel, aes(x = time, y = C_H1, color = nu_fct, group = nu_fct)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ nu_fct, nrow = 1, scales = "fixed") +
+  scale_color_manual(values = pal_nu, guide = "none") +
+  scale_x_continuous(limits = c(0, 200), breaks = seq(0, 200, 50)) +
+  labs(x = "Time (days)", y = "C_H1 prevalence") +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    panel.grid.minor = element_blank()
+  )
+
+
+
+#### Incidence curve
+
+nu_inc <- nu_sel %>%
+  mutate(
+    inc_H1 = C_H1 - dplyr::lag(C_H1),   # daily incidence
+    inc_H1 = if_else(time == min(time), NA_real_, inc_H1)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    nu_fct = factor(nu, levels = sort(unique(nu)))
+  )
+
+nu_inc <- nu_inc %>%
+  mutate(inc_H1 = if_else(inc_H1 < 0, 0, inc_H1))
+
+reds <- c("#4B0000", "#7A1A1A", "#A64A4A", "#D08A8A")  # dark -> light
+pal_nu <- setNames(reds[seq_along(levels(nu_inc$nu_fct))], levels(nu_inc$nu_fct))
+
+ggplot(nu_inc, aes(x = time, y = inc_H1, color = nu_fct)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    values = pal_nu,
+    name = expression(nu)
+  ) +
+  scale_x_continuous(
+    limits = c(0, 200),
+    breaks = seq(0, 200, 50)
+  ) +
+  labs(
+    x = "Time (days)",
+    y = "Daily incidence (ΔC_H1)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+
+
 
 
 ###############################################################################
-# 6. Additional exploratory visualizations (sandbox)
+# 7. Additional exploratory visualizations (sandbox)
 #
 #    NOTE (8.7.25): sections below are experimental and may produce odd results.
 #    They are kept here for development/reference and are not part of the
@@ -602,7 +695,7 @@ param_max <- c(
 
 #########
 
-n_samples <- 500  # or 1000 if machine can handle it
+n_samples <- 500  # or 1000 if your machine can handle it
 
 lhs_raw <- randomLHS(n_samples, length(param_names))
 
@@ -614,6 +707,10 @@ colnames(lhs_params) <- param_names
 
 ############################
 
+
+
+# n_samples should already be defined, e.g.:
+# n_samples <- 500
 
 outcomes <- data.frame(
   total_coinfection = rep(NA_real_, n_samples),
