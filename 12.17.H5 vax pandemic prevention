@@ -1,0 +1,1689 @@
+
+# title: "Two-Virus SLIR Model with Vaccination: Simulation Workflow"
+# author: "Kit D. McLean, Phd -- Postdoc Fellow, U of Michigan Dept of Epidemiology"
+
+# This document simulates a two-virus SLIR model with vaccination.
+# We examine how different vaccination rates (nu) affect epidemic dynamics of seasonal flu (H1) and avian flu (H5).
+
+###############################################################################
+# 1. Setup: metadata and required packages
+###############################################################################
+
+# Load necessary packages
+library(deSolve)
+library(furrr)
+library(future)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(lhs)
+library(ppcor)
+library(scales)
+library(GGally)
+library(patchwork)
+library(cowplot)
+library(grid)
+
+
+###############################################################################
+# 2. Core model definition
+#    - Parameters and base parameter list
+#    - ODE system (SLIR_two_virus_vax)
+#    - Initial conditions
+#    - Simulation time settings
+###############################################################################
+
+#### Define Parameters and Initial Conditions
+
+PopSize   <- 10000
+CowPop    <- 280000 
+
+H5_cow_prev_peak <- 0.50   # peak fraction of herd infected
+InfCowPop_peak   <- CowPop * H5_cow_prev_peak
+
+# Time-varying H5 prevalence in cattle: simple Gaussian epidemic
+InfCowPop_t <- function(t, params) {
+  t_peak <- 100
+  sigma  <- 40
+  
+  # baseline peak prevalence = 40%
+  baseline_peak <- 0.40
+  
+  # multiply by sampled factor (e.g., 0.5–1.5)
+  peak_prev <- baseline_peak * params$cow_prev_factor
+  
+  InfCowPop_peak <- CowPop * peak_prev
+  
+  InfCowPop_peak * exp(-((t - t_peak)^2) / (2 * sigma^2))
+}
+
+
+
+# Contact rate between dairy workers and sick cattle
+contact_rate_cow2human <- 1
+
+# Transmission rates (initial placeholders; overwritten by calibration below)
+beta1 <- 0.9          # initial guess for H1 (seasonal flu)
+beta5 <- 1e-8         # initial guess for H5 (avian flu)
+
+# Latent periods (1 / incubation period)
+sigma1 <- 1/3   # H1
+sigma5 <- 1/4   # H5
+
+# Recovery rates (1 / infectious period)
+gamma1 <- 1/5   # H1
+gamma5 <- 1/9   # H5
+gammac <- 1/9   # Co-infection
+
+# Cross-immunity factors (1 == no effect)
+chi15 <- 0.9      # H1 infection & recovery DECREASES susceptibility to H5
+chi51 <- 0.9      # H5 infection & recovery DECREASES susceptibility to H1 
+
+# Vaccine efficacies
+VE1 <- 0.5    # H1 vaccine efficacy against H1 infection
+VE5 <- 0      # H1 vaccine efficacy against H5 infection
+
+# Vaccination recovery rate modifier (vaccinated recover faster)
+delta1 <- 1.3   # H1 vaccinated recover from H1 30% faster
+delta5 <- 1     # H1 vaccinated do not recover from H5 any faster
+
+# Vaccination rate (will be overwritten)
+nu <- 0
+
+# Amplitude multiplier on cow epidemic peak (1 = baseline 40% prevalence)
+cow_prev_factor <- 1
+
+# Define a template parameter list
+base_params <- list(beta1 = beta1, 
+                    beta5 = beta5,
+                    sigma1 = sigma1,
+                    sigma5 = sigma5,
+                    gamma1 = gamma1,
+                    gamma5 = gamma5,
+                    gammac = gammac,
+                    chi15 = chi15,
+                    chi51 = chi51,
+                    VE1 = VE1,
+                    VE5 = VE5,
+                    delta1 = delta1,
+                    delta5 = delta5,
+                    nu = nu,
+                    cow_prev_factor = cow_prev_factor
+                    )  
+
+
+#### 2.2 ODE system: SLIR_two_virus_vax
+
+SLIR_two_virus_vax <- function(t, x, params) {
+  
+  with(as.list(c(as.list(x), params)), {
+    
+    N <- sum(x)
+    
+    # Forces of infection
+    lambda1     <- beta1 * (I1S5 + I1L5 + I1I5a + I1I5b + I1R5 +
+                          vax_I1S5 + vax_I1L5 + vax_I1I5a + vax_I1I5b + vax_I1R5) / N
+    
+    lambda5 <- beta5 * InfCowPop_t(t, params) * contact_rate_cow2human
+    
+    
+    lambda1_vax <- (1 - VE1) * lambda1
+    lambda5_vax <- (1 - VE5) * lambda5
+    
+    ## Unvaccinated
+    dS1S5    <- -lambda1 * S1S5 - lambda5 * S1S5 - nu * S1S5 # 
+    dL1S5    <- lambda1 * S1S5 - sigma1 * L1S5 - lambda5 * L1S5 #
+    dI1S5    <- sigma1 * L1S5 - gamma1 * I1S5 - lambda5 * I1S5 #
+    dR1S5    <- gamma1 * I1S5 - chi15 * lambda5 * R1S5 #
+    dR1L5    <- chi15 * lambda5 * R1S5 - sigma5 * R1L5 #
+    dR1I5    <- sigma5 * R1L5 - gamma5 * R1I5 + gamma1 * I1L5 #
+    dI1L5    <- lambda5 * I1S5 + lambda5 * L1S5 - sigma5 * I1L5 - gamma1 * I1L5 #
+    dI1I5a   <- sigma5 * I1L5 - gammac * I1I5a #
+    dS1L5    <- lambda5 * S1S5 - sigma5 * S1L5 - lambda1 * S1L5 #
+    dS1I5    <- sigma5 * S1L5 - gamma5 * S1I5 - lambda1 * S1I5 #
+    dS1R5    <- gamma5 * S1I5 - chi51 * lambda1 * S1R5 #
+    dL1R5    <- chi51 * lambda1 * S1R5 - sigma1 * L1R5 #
+    dI1R5    <- sigma1 * L1R5 - gamma1 * I1R5 + gamma5 * L1I5 #
+    dL1I5    <- lambda1 * S1L5 + lambda1 * S1I5 - sigma1 * L1I5 - gamma5 * L1I5 #
+    dI1I5b   <- sigma1 * L1I5 - gammac * I1I5b #
+    
+    ## Vaccinated
+    dvax_S1S5  <- nu * S1S5 - lambda1_vax * vax_S1S5 - lambda5_vax * vax_S1S5 #
+    dvax_L1S5  <- lambda1_vax * vax_S1S5 - sigma1 * vax_L1S5 - lambda5_vax * vax_L1S5 #
+    dvax_I1S5  <- sigma1 * vax_L1S5 - delta1 * gamma1 * vax_I1S5 - lambda5_vax * vax_I1S5 #
+    dvax_R1S5  <- delta1 * gamma1 * vax_I1S5 - chi15 * lambda5_vax * vax_R1S5 #
+    dvax_R1L5  <- chi15 * lambda5_vax * vax_R1S5 - sigma5 * vax_R1L5 #
+    dvax_R1I5  <- sigma5 * vax_R1L5 - delta5 * gamma5 * vax_R1I5 + delta1 * gamma1 * vax_I1L5 #
+    dvax_I1L5  <- lambda5_vax * vax_I1S5 + lambda5_vax * vax_L1S5 - sigma5 * vax_I1L5 - delta1 * gamma1 * vax_I1L5 # 
+    dvax_I1I5a <- sigma5 * vax_I1L5 - gammac * vax_I1I5a #
+    dvax_S1L5  <- lambda5_vax * vax_S1S5 - sigma5 * vax_S1L5 - lambda1_vax * vax_S1L5 #
+    dvax_S1I5  <- sigma5 * vax_S1L5 - delta5 * gamma5 * vax_S1I5 - lambda1_vax * vax_S1I5 #
+    dvax_S1R5  <- delta5 * gamma5 * vax_S1I5 - chi51 * lambda1_vax * vax_S1R5  #
+    dvax_L1R5  <- chi51 * lambda1_vax * vax_S1R5 - sigma1 * vax_L1R5 #
+    dvax_I1R5  <- sigma1 * vax_L1R5 - delta1 * gamma1 * vax_I1R5 + delta5 * gamma5 * vax_L1I5 #
+    dvax_L1I5  <- lambda1_vax * vax_S1L5 + lambda1_vax * vax_S1I5 - sigma1 * vax_L1I5 - delta5 * gamma5 * vax_L1I5 #
+    dvax_I1I5b <- sigma1 * vax_L1I5 - gammac * vax_I1I5b #
+    
+    ## Fully immune
+    dR1R5   <- gamma1 * I1R5 + gamma5 * R1I5 + gammac * (I1I5a + I1I5b) +
+      delta1 * gamma1 * vax_I1R5 + delta5 * gamma5 * vax_R1I5 + gammac * (vax_I1I5a + vax_I1I5b) #
+    
+    ## Cumulative coinfections
+    dC_coinfection <- sigma5 * I1L5 + sigma1 * L1I5 +
+      sigma5 * vax_I1L5 + sigma1 * vax_L1I5
+    
+    ## Cumulative H1 infections
+    dC_H1 <- lambda1 * (S1S5 + S1L5 + S1I5 + S1R5) +
+      lambda1_vax * (vax_S1S5 + vax_S1L5 + vax_S1I5 + vax_S1R5)
+    
+    ## Cumulative H5 infections
+    dC_H5 <- lambda5 * (S1S5 + L1S5 + I1S5 + R1S5) +
+      lambda5_vax * (vax_S1S5 + vax_L1S5 + vax_I1S5 + vax_R1S5)
+    
+    ## Cumulative vaccinations 
+    dC_Vax <- nu * S1S5
+    
+    ## Return derivatives
+    list(c(
+      dS1S5, dL1S5, dI1S5, dR1S5, dR1L5, dR1I5,
+      dI1L5, dI1I5a, dS1L5, dS1I5, dS1R5, dL1R5,
+      dI1R5, dL1I5, dI1I5b,
+      dvax_S1S5, dvax_L1S5, dvax_I1S5, dvax_R1S5,
+      dvax_R1L5, dvax_R1I5, dvax_I1L5, dvax_I1I5a,
+      dvax_S1L5, dvax_S1I5, dvax_S1R5, dvax_L1R5,
+      dvax_I1R5, dvax_L1I5, dvax_I1I5b,
+      dR1R5, dC_coinfection, dC_H1, dC_H5, dC_Vax
+    ))
+  })
+}
+
+
+#### Set Initial Conditions
+
+# Initialize all compartments to zero
+x0 <- numeric(35)
+
+# Set initial conditions
+x0[1] <- PopSize - 7   # S1S5: fully susceptible, unvaccinated
+x0[3] <- 3              # I1S5: infected with H1 only
+x0[10] <- 0             # S1I5: infected with H5 only
+
+# State variable names
+names(x0) <- c("S1S5","L1S5","I1S5","R1S5","R1L5","R1I5",
+               "I1L5","I1I5a","S1L5","S1I5","S1R5","L1R5","I1R5",
+               "L1I5","I1I5b","vax_S1S5","vax_L1S5","vax_I1S5","vax_R1S5",
+               "vax_R1L5","vax_R1I5","vax_I1L5","vax_I1I5a","vax_S1L5","vax_S1I5",
+               "vax_S1R5","vax_L1R5","vax_I1R5","vax_L1I5","vax_I1I5b","R1R5", 
+               "C_coinfection", "C_H1", "C_H5", "C_Vax")
+
+
+#### Simulation Settings
+
+# Time steps
+times <- seq(0, 200, by = 1)  # Daily for 200 days
+
+season_length <- 200  # days 
+
+
+###############################################################################
+# 3. Calibration utilities and calibrated parameter values
+#    - Helper functions to calibrate:
+#        * beta1 to target H1 attack rate
+#        * beta5 to target H5 attack rate
+#        * nu to target final vaccination coverage
+#    - Apply calibration and store calibrated values
+###############################################################################
+
+#### Helper to compute H5 attack rate for a given beta5 ----------------------
+
+compute_H5_attack <- function(beta5_value,
+                              base_params,
+                              x0,
+                              times) {
+  
+  params <- base_params
+  params$beta5  <- beta5_value
+  
+  # Remove H1 and all vaccination effects to match calibration setup
+  params$beta1  <- 0
+  params$nu     <- 0
+  params$VE1    <- 0
+  params$VE5    <- 0
+  params$delta1 <- 1
+  params$delta5 <- 1
+  
+  # Fully susceptible workers, no initial H1 or H5
+  x0_cal <- x0
+  x0_cal[]       <- 0
+  x0_cal["S1S5"] <- PopSize
+  
+  out <- ode(y = x0_cal, times = times,
+             func = SLIR_two_virus_vax, parms = params)
+  df  <- as.data.frame(out)
+  
+  tail(df$C_H5, 1) / PopSize
+}
+
+#### Calibration utilities ---------------------------------------------------
+
+calibrate_beta1 <- function(target_attack,
+                            base_params,
+                            x0,
+                            times,
+                            beta_interval = c(0.05, 1)) {
+  
+  attack_diff <- function(beta1_guess) {
+    params <- base_params
+    params$beta1  <- beta1_guess
+    params$beta5  <- 0
+    params$nu     <- 0
+    params$VE1    <- 0
+    params$VE5    <- 0
+    params$delta1 <- 1
+    params$delta5 <- 1
+    
+    x0_cal <- x0
+    x0_cal["S1S5"] <- PopSize - 10
+    x0_cal["I1S5"] <- 10
+    x0_cal["S1I5"] <- 0
+    
+    out <- ode(y = x0_cal, times = times,
+               func = SLIR_two_virus_vax, parms = params)
+    df  <- as.data.frame(out)
+    
+    tail(df$C_H1, 1) / PopSize - target_attack
+  }
+  
+  uniroot(attack_diff, interval = beta_interval)$root
+}
+
+calibrate_beta5_attack <- function(target_attack_H5,
+                                   base_params,
+                                   x0,
+                                   times,
+                                   beta_interval = c(1e-10, 1e-8)
+) {
+  
+  attack_diff <- function(beta5_guess) {
+    compute_H5_attack(beta5_guess,
+                      base_params = base_params,
+                      x0          = x0,
+                      times       = times) -
+      target_attack_H5
+  }
+  
+  uniroot(attack_diff, interval = beta_interval)$root
+}
+
+calibrate_nu <- function(target_coverage,
+                         base_params,
+                         x0,
+                         times,
+                         nu_interval = c(0, 1)) {
+  
+  coverage_diff <- function(nu_guess) {
+    params <- base_params
+    params$nu <- nu_guess
+    
+    out <- ode(y = x0, times = times,
+               func = SLIR_two_virus_vax, parms = params)
+    df  <- as.data.frame(out)
+    
+    tail(df$C_Vax, 1) / PopSize - target_coverage
+  }
+  
+  uniroot(coverage_diff, interval = nu_interval)$root
+}
+
+#### Calibrate parameters ----------------------------------------------------
+
+target_attack_H1 <- 0.25
+
+beta1_calibrated <- calibrate_beta1(target_attack = target_attack_H1,
+                                    base_params   = base_params,
+                                    x0            = x0,
+                                    times         = times)
+## Sweep over a beta5 grid and compute attack rates
+
+# Choose a grid of beta5 values around your search interval
+beta5_grid <- 10^seq(-12, -7, length.out = 25)
+
+H5_attack_grid <- sapply(beta5_grid, compute_H5_attack,
+                         base_params = base_params,
+                         x0          = x0,
+                         times       = times)
+
+diagnostic_df <- data.frame(
+  beta5  = beta5_grid,
+  attack = H5_attack_grid
+)
+
+
+target_attack_H5 <- 0.07
+
+beta5_calibrated <- calibrate_beta5_attack(
+  target_attack_H5 = target_attack_H5,
+  base_params      = base_params,
+  x0               = x0,
+  times            = times,
+  beta_interval    = c(1e-10, 1e-8)
+)
+
+desired_coverages <- c(0, 0.05, 0.25, 0.60, 0.80)
+
+nu_values <- sapply(desired_coverages, function(cov) {
+  calibrate_nu(target_coverage = cov,
+               base_params     = base_params,
+               x0              = x0,
+               times           = times,
+               nu_interval     = c(0, 0.1))
+})
+
+nu_min_lhs <- min(nu_values)
+nu_max_lhs <- max(nu_values)
+
+base_params$beta1 <- beta1_calibrated
+base_params$beta5 <- beta5_calibrated
+###############################################################################
+# 4. Model calibration / validation sanity checks
+###############################################################################
+
+## 4.1 Baseline run with ν = 0 (Fig S1/S2/S3) --------------------------------
+
+params_baseline <- base_params
+params_baseline$nu <- 0
+
+baseline_out <- deSolve::ode(
+  y     = x0,
+  times = times,
+  func  = SLIR_two_virus_vax,
+  parms = params_baseline
+)
+
+baseline_df <- as.data.frame(baseline_out)
+
+## 4.2 Incidence curves over time (Fig S1) -----------------------------------
+
+# Simple finite differences of cumulatives give daily incidence (dt = 1 day)
+baseline_inc <- baseline_df %>%
+  dplyr::mutate(
+    inc_H1    = c(NA, diff(C_H1)),
+    inc_H5    = c(NA, diff(C_H5)),
+    inc_coinf = c(NA, diff(C_coinfection))
+  ) %>%
+  dplyr::filter(!is.na(inc_H1)) %>%  # drop the first NA row
+  dplyr::select(time, inc_H1, inc_H5, inc_coinf) %>%
+  tidyr::pivot_longer(
+    cols      = c(inc_H1, inc_H5, inc_coinf),
+    names_to  = "outcome",
+    values_to = "incidence"
+  ) %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(
+      outcome,
+      inc_H1    = "H1 incidence",
+      inc_H5    = "H5 incidence",
+      inc_coinf = "H1+H5 coinfection incidence"
+    )
+  )
+
+ggplot2::ggplot(baseline_inc,
+                ggplot2::aes(x = time, y = incidence, colour = outcome)) +
+  ggplot2::geom_line(size = 1) +
+  ggplot2::labs(
+    x = "Time (days)",
+    y = "Daily incidence",
+    colour = "Outcome",
+    title = "Baseline incidence curves (ν = 0)"
+  ) +
+  ggplot2::theme_minimal(base_size = 14)
+
+## 4.3 Calibrated attack rates vs targets (Table / Fig S2) -------------------
+
+final_row <- dplyr::slice_tail(baseline_df, n = 1)
+
+attack_H1_baseline <- final_row$C_H1 / PopSize
+attack_H5_baseline <- final_row$C_H5 / PopSize
+
+attack_summary <- data.frame(
+  Outcome         = c("H1 attack rate", "H5 attack rate"),
+  Target          = c(target_attack_H1, target_attack_H5),
+  Achieved        = c(attack_H1_baseline, attack_H5_baseline),
+  stringsAsFactors = FALSE
+)
+
+print(attack_summary)
+
+## 4.4 Cumulative trajectories over time (Fig S3) ----------------------------
+
+baseline_cum_long <- baseline_df %>%
+  dplyr::select(time, C_H1, C_H5, C_coinfection) %>%
+  tidyr::pivot_longer(
+    cols      = c(C_H1, C_H5, C_coinfection),
+    names_to  = "outcome",
+    values_to = "cumulative"
+  ) %>%
+  dplyr::mutate(
+    outcome = dplyr::recode(
+      outcome,
+      C_H1         = "Cumulative H1 infections",
+      C_H5         = "Cumulative H5 infections",
+      C_coinfection = "Cumulative H1+H5 coinfections"
+    )
+  )
+
+ggplot2::ggplot(baseline_cum_long,
+                ggplot2::aes(x = time, y = cumulative, colour = outcome)) +
+  ggplot2::geom_line(size = 1.1) +
+  ggplot2::labs(
+    x = "Time (days)",
+    y = "Cumulative count",
+    colour = "Outcome",
+    title = "Cumulative infections and coinfections over the season (ν = 0)"
+  ) +
+  ggplot2::theme_minimal(base_size = 14)
+
+
+
+###############################################################################
+# 5. Vaccination–coinfection relationship (nu sweep)
+#    - Sweep nu over a fine grid
+#    - Run ODE model in parallel
+#    - Compute total coinfections and coverage
+#    - Plot coinfection burden vs vaccination coverage
+###############################################################################
+
+
+# Creating a nice figure showing the relationship between nu values (vaccination rate) and cumulative coinfection
+
+# Set up parallel backend
+plan(multisession)  
+
+# Define vaccination rate range
+nu_vals <- seq(nu_min_lhs, nu_max_lhs, length.out = 200)
+
+# Run simulations in parallel
+results <- future_map(nu_vals, function(nu) {
+  
+  # Clone parameter list and update vaccination rate
+  params <- base_params
+  params$nu <- nu
+  
+  # Run ODE model
+  vrout <- ode(y = x0, times = times, func = SLIR_two_virus_vax, parms = params)
+  
+  # Store results as dataframe
+  df <- as.data.frame(vrout)
+  df$nu <- nu
+  return(df)
+  
+}, .options = furrr_options(seed = TRUE))  # for reproducibility
+
+# Combine into a single data frame
+nu_sim_data <- bind_rows(results) %>%
+  mutate(vax_coverage = C_Vax / PopSize * 100)
+
+peak_cumulative <- nu_sim_data %>%
+  filter(time == 200) 
+
+
+ggplot(peak_cumulative, aes(x = vax_coverage , y = C_coinfection)) +
+  geom_line(color = "green", size = 1.2) +
+  labs(
+    x = "Vaccination coverage of worker population (%)",
+    y = "Total no. coinfected workers during flu season",
+    title = "Seasonal Coinfection Burden vs Vaccination Rate"
+  ) +
+  theme_minimal(base_size = 14) 
+
+
+saveRDS(list(
+  beta1 = beta1_calibrated,
+  beta5 = beta5_calibrated,
+  nu_range = c(nu_min_lhs, nu_max_lhs)
+), "calibrated_parameters.rds")
+
+###############################################################################
+# 7. Visualizing the relationships between H1 infection, coinfection, and 
+#    vaccination coverage in s few different ways
+#
+#
+###############################################################################
+
+#Vax coverage targets
+
+targets <- c(5, 20, 50, 80)
+
+# Find the actual vax_coverage values in your data that are closest to each target & the associated nu values
+closest_vax <- peak_cumulative %>%
+  distinct(vax_coverage, nu) %>%                 # keep nu attached
+  tidyr::expand_grid(target = targets) %>%
+  mutate(diff = abs(vax_coverage - target)) %>%
+  group_by(target) %>%
+  slice_min(diff, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(target) %>%
+  dplyr::select(target, vax_coverage, nu, diff)
+
+closest_vax
+
+# gives the *actual* vax_coverage values used for panels
+
+# Now filter the full data to only those chosen coverages by the nu value
+nu_sel <- nu_sim_data %>%
+  semi_join(closest_vax, by = "nu")  %>%
+  mutate(
+    # order panels by increasing nu (low -> high)
+    nu_fct = factor(nu, levels = sort(unique(nu)))
+  )
+
+
+# Dark-to-light reds (low nu darkest, high nu lightest)
+reds <- c("#4B0000", "#7A1A1A", "#A64A4A", "#D08A8A")
+pal_nu <- setNames(reds[seq_along(levels(nu_sel$nu_fct))], levels(nu_sel$nu_fct))
+
+ggplot(nu_sel, aes(x = time, y = C_H1, color = nu_fct, group = nu_fct)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ nu_fct, nrow = 1, scales = "fixed") +
+  scale_color_manual(values = pal_nu, guide = "none") +
+  scale_x_continuous(limits = c(0, 200), breaks = seq(0, 200, 50)) +
+  labs(x = "Time (days)", y = "C_H1 prevalence") +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    panel.grid.minor = element_blank()
+  )
+
+
+
+#### Incidence curve
+
+nu_inc <- nu_sel %>%
+  mutate(
+    inc_H1 = C_H1 - dplyr::lag(C_H1),   # daily incidence
+    inc_H1 = if_else(time == min(time), NA_real_, inc_H1)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    nu_fct = factor(nu, levels = sort(unique(nu)))
+  )
+
+nu_inc <- nu_inc %>%
+  mutate(inc_H1 = if_else(inc_H1 < 0, 0, inc_H1))
+
+reds <- c("#4B0000", "#7A1A1A", "#A64A4A", "#D08A8A")  # dark -> light
+pal_nu <- setNames(reds[seq_along(levels(nu_inc$nu_fct))], levels(nu_inc$nu_fct))
+
+ggplot(nu_inc, aes(x = time, y = inc_H1, color = nu_fct)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    values = pal_nu,
+    name = expression(nu)
+  ) +
+  scale_x_continuous(
+    limits = c(0, 200),
+    breaks = seq(0, 200, 50)
+  ) +
+  labs(
+    x = "Time (days)",
+    y = "Daily incidence (ΔC_H1)"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+
+
+
+
+
+###############################################################################
+# 7. Additional exploratory visualizations (sandbox)
+#
+#    NOTE (8.7.25): sections below are experimental and may produce odd results.
+#    They are kept here for development/reference and are not part of the
+#    primary analysis presented in the manuscript.
+###############################################################################
+
+
+# Parameters to vary in LHS
+param_names <- c(
+  "beta1", "beta5",
+  "sigma1", "sigma5",
+  "gamma1", "gamma5", "gammac",
+  "chi15", "chi51",
+  "VE1",
+  "delta1",
+  "nu", 
+  "cow_prev_factor"# vaccination rate
+  # optional: "t_peak_cow", "sigma_cow", "H5_cow_prev_peak"
+)
+
+# Center around calibrated / baseline values
+param_min <- c(
+  0.5 * beta1_calibrated,   # 50–150% of calibrated β1
+  0.5 * beta5_calibrated,   # 50–150% of calibrated β5
+  1/5,                      # sigma1: incubation 2–5 days
+  1/6,                      # sigma5: 2–6 days
+  1/7,                      # gamma1: infectious 3–7 days
+  1/10,                     # gamma5: 5–10 days
+  1/10,                     # gammac: 5–10 days
+  0.6,                      # chi15: moderate–strong cross-immunity
+  0.6,                      # chi51: same
+  0.3,                      # VE1: 30–70% vaccine efficacy
+  1.0,                      # delta1: no faster recovery at lower bound
+  nu_min_lhs,                # ν range based on your coverage calibration
+  0.5
+  )
+
+param_max <- c(
+  1.5 * beta1_calibrated,
+  1.5 * beta5_calibrated,
+  1/2,
+  1/3,
+  1/3,
+  1/6,
+  1/6,
+  0.95,
+  0.95,
+  0.7,
+  1.6,                      # say up to +60% faster recovery in vax
+  nu_max_lhs,
+  1.5
+)
+
+#########
+
+n_samples <- 500  # or 1000 if your machine can handle it
+
+lhs_raw <- randomLHS(n_samples, length(param_names))
+
+lhs_params <- matrix(NA_real_, n_samples, length(param_names))
+for (i in seq_along(param_names)) {
+  lhs_params[, i] <- param_min[i] + lhs_raw[, i] * (param_max[i] - param_min[i])
+}
+colnames(lhs_params) <- param_names
+
+############################
+
+
+
+# n_samples should already be defined, e.g.:
+# n_samples <- 500
+
+outcomes <- data.frame(
+  total_coinfection = rep(NA_real_, n_samples),
+  total_H1          = rep(NA_real_, n_samples),
+  total_H5          = rep(NA_real_, n_samples)
+)
+
+
+for (i in seq_len(n_samples)) {
+  
+  params <- base_params
+  params[names(lhs_params[i, ])] <- lhs_params[i, ]
+  
+  sim <- ode(y = x0, times = times,
+             func = SLIR_two_virus_vax, parms = params)
+  df <- as.data.frame(sim)
+  
+  outcomes$total_coinfection[i] <- df$C_coinfection[nrow(df)]
+  outcomes$total_H1[i]          <- df$C_H1[nrow(df)]
+  outcomes$total_H5[i]          <- df$C_H5[nrow(df)]
+}
+
+###############################
+# Rank transform and PRCC with outcome = C_coinfection
+###############################
+
+set.seed(123)  
+
+bootstrap_prcc <- function(X_rank, Y, nboot = 1000) {
+  
+  n <- nrow(X_rank)
+  k <- ncol(X_rank)
+  
+  prcc_boot <- matrix(NA_real_, nrow = nboot, ncol = k)
+  
+  for (b in seq_len(nboot)) {
+    idx <- sample(seq_len(n), size = n, replace = TRUE)
+    Xb  <- X_rank[idx, , drop = FALSE]
+    Yb  <- Y[idx]
+    
+    dat <- cbind(Yb, Xb)
+    
+    # Use Pearson here because we've *already* rank-transformed
+    pc <- suppressWarnings(
+      ppcor::pcor(dat, method = "pearson")
+    )$estimate
+    
+    est <- pc[2:(k + 1), 1]
+    prcc_boot[b, ] <- est
+  }
+  
+  # Drop any bootstrap draws that ended up with NA (e.g., perfectly collinear resample)
+  keep <- apply(!is.na(prcc_boot), 1, all)
+  prcc_boot_clean <- prcc_boot[keep, , drop = FALSE]
+  
+  prcc_mean <- apply(prcc_boot_clean, 2, mean)
+  prcc_ci   <- apply(prcc_boot_clean, 2, quantile, probs = c(0.025, 0.975))
+  
+  list(
+    prcc = prcc_mean,
+    ci   = prcc_ci,
+    boot = prcc_boot_clean
+  )
+}
+
+
+# Rank-transform parameters
+X_rank <- apply(lhs_params, 2, rank)
+colnames(X_rank) <- colnames(lhs_params)
+
+# Rank-transform outcomes
+Y_coinf <- rank(outcomes$total_coinfection)
+Y_H1    <- rank(outcomes$total_H1)
+Y_H5    <- rank(outcomes$total_H5)
+
+# Bootstrap PRCCs
+prcc_coinf_results <- bootstrap_prcc(X_rank, Y_coinf, nboot = 1000)
+prcc_H1_results    <- bootstrap_prcc(X_rank, Y_H1,    nboot = 1000)
+prcc_H5_results    <- bootstrap_prcc(X_rank, Y_H5,    nboot = 1000)
+
+prcc_coinf_results$outcome <- "Total coinfections"
+prcc_H1_results$outcome    <- "Total H1"
+prcc_H5_results$outcome    <- "Total H5"
+
+
+
+### Gather results into one list
+
+# Parameter names (must match columns in lhs_params / X_rank)
+param_names <- colnames(lhs_params)
+
+prcc_list_to_df <- function(res, param_names) {
+  data.frame(
+    Parameter = param_names,
+    PRCC      = as.numeric(res$prcc),
+    CI_low    = as.numeric(res$ci[1, ]),
+    CI_high   = as.numeric(res$ci[2, ]),
+    outcome   = res$outcome,
+    stringsAsFactors = FALSE
+  )
+}
+
+prcc_coinf_df <- prcc_list_to_df(prcc_coinf_results, param_names)
+prcc_H1_df    <- prcc_list_to_df(prcc_H1_results,    param_names)
+prcc_H5_df    <- prcc_list_to_df(prcc_H5_results,    param_names)
+
+# Now combine into one long data.frame
+prcc_all <- dplyr::bind_rows(prcc_coinf_df, prcc_H1_df, prcc_H5_df)
+
+str(prcc_all)
+# 'data.frame':  36 obs. of  5 variables:
+
+
+###############################
+# Plot PRCC bar chart
+###############################
+panel_labels <- c(
+  "Total coinfections" = "A. Total H1+H5 Coinfections",
+  "Total H1"           = "B. Total H1 Infections",
+  "Total H5"           = "C. Total H5 Infections"
+)
+
+prcc_all$outcome <- factor(
+  prcc_all$outcome,
+  levels = c("Total coinfections", "Total H1", "Total H5")
+)
+
+param_order <- prcc_all %>%
+  dplyr::filter(outcome == "Total coinfections") %>%
+  dplyr::arrange(PRCC) %>%
+  dplyr::pull(Parameter)
+
+prcc_all$Parameter <- factor(prcc_all$Parameter, levels = param_order)
+
+ggplot(prcc_all, aes(x = Parameter, y = PRCC)) +
+  geom_col(fill = "steelblue") +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.3) +
+  coord_flip() +
+  facet_wrap(
+    ~ outcome,
+    scales = "free_y",
+    labeller = labeller(outcome = panel_labels)
+  ) +
+  labs(
+    x = "Parameter",
+    y = "Partial Rank Correlation Coefficient (PRCC)",
+    title = "Global sensitivity of infection outcomes to model parameters"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.text = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 11)
+  )
+
+
+prcc_table <- prcc_all |>
+  dplyr::select(Parameter, outcome, PRCC, CI_low, CI_high) |>
+  dplyr::arrange(outcome, dplyr::desc(abs(PRCC)))
+
+print(prcc_table)
+
+
+###############################
+###############################################################################
+# 6. Uncertainty around the vaccination–coinfection curve
+#    - LHS over key epidemiologic parameters (excluding nu)
+#    - For each parameter set, sweep nu over a grid
+#    - Summarize median and 95% interval of coinfections vs coverage
+#    - Overlay baseline (no-uncertainty) curve
+###############################################################################
+
+## 6.1 Choose parameters to vary for the curve --------------------------------
+
+# All parameters to vary *except* nu (which will be swept explicitly)
+param_names_curve <- setdiff(param_names, "nu")
+
+# Match min/max in the same order as param_names_curve
+param_min_curve <- param_min[match(param_names_curve, param_names)]
+param_max_curve <- param_max[match(param_names_curve, param_names)]
+
+## 6.2 Latin Hypercube for curve analysis -------------------------------------
+
+set.seed(1234)  # reproducibility
+
+n_sets <- 150   # number of parameter sets for the curve uncertainty
+
+lhs_raw_curve    <- randomLHS(n_sets, length(param_names_curve))
+lhs_params_curve <- matrix(NA_real_, n_sets, length(param_names_curve))
+
+for (i in seq_along(param_names_curve)) {
+  lhs_params_curve[, i] <-
+    param_min_curve[i] +
+    lhs_raw_curve[, i] * (param_max_curve[i] - param_min_curve[i])
+}
+colnames(lhs_params_curve) <- param_names_curve
+
+## 6.3 Define a grid of nu values to sweep ------------------------------------
+
+# Use the calibrated nu range from your coverage calibration
+nu_grid <- seq(nu_min_lhs, nu_max_lhs, length.out = 40)
+
+## 6.4 Run nu sweep for each parameter set (in parallel) ----------------------
+
+plan(multisession)  # parallel backend (furrr / future)
+
+curve_results <- furrr::future_map(
+  seq_len(n_sets),
+  function(j) {
+    
+    # Take j-th LHS parameter set and plug into base_params
+    params_j <- base_params
+    params_j[names(lhs_params_curve[j, ])] <- lhs_params_curve[j, ]
+    
+    # For this parameter set, sweep nu over the grid
+    out_j <- lapply(nu_grid, function(nu_val) {
+      
+      params_j$nu <- nu_val
+      
+      sim <- ode(
+        y     = x0,
+        times = times,
+        func  = SLIR_two_virus_vax,
+        parms = params_j
+        # , method = "vode"  # uncomment for faster stiff solver
+      )
+      
+      df <- as.data.frame(sim)
+      
+      data.frame(
+        sample_id    = j,
+        nu           = nu_val,
+        vax_coverage = df$C_Vax[nrow(df)] / PopSize,      # final coverage
+        coinfection  = df$C_coinfection[nrow(df)]         # final total coinfections
+      )
+    })
+    
+    dplyr::bind_rows(out_j)
+  },
+  .options = furrr::furrr_options(seed = TRUE)  # reproducible parallel RNG
+)
+
+# Combine all parameter sets into one data frame
+curve_df <- dplyr::bind_rows(curve_results)
+
+## 6.5 Summarize uncertainty across parameter sets ----------------------------
+
+# For each nu, summarize distribution across parameter sets
+summary_curve <- curve_df %>%
+  dplyr::group_by(nu) %>%
+  dplyr::summarise(
+    vax_cov_med = median(vax_coverage),
+    vax_cov_lo  = quantile(vax_coverage, 0.025),
+    vax_cov_hi  = quantile(vax_coverage, 0.975),
+    
+    coinf_med   = median(coinfection),
+    coinf_lo    = quantile(coinfection, 0.025),
+    coinf_hi    = quantile(coinfection, 0.975),
+    .groups     = "drop"
+  ) %>%
+  dplyr::arrange(vax_cov_med)
+
+## 6.6 Baseline (no-uncertainty) curve ---------------------------------------
+
+baseline_curve <- purrr::map_dfr(nu_grid, function(nu_val) {
+  
+  params0 <- base_params
+  params0$nu <- nu_val
+  
+  sim0 <- ode(
+    y     = x0,
+    times = times,
+    func  = SLIR_two_virus_vax,
+    parms = params0
+    # , method = "vode"
+  )
+  
+  df0 <- as.data.frame(sim0)
+  
+  data.frame(
+    nu           = nu_val,
+    vax_coverage = df0$C_Vax[nrow(df0)] / PopSize,
+    coinfection  = df0$C_coinfection[nrow(df0)]
+  )
+}) %>%
+  dplyr::arrange(vax_coverage)
+
+## 6.7 Plot: vaccination coverage vs coinfection burden -----------------------
+
+ggplot() +
+  # Uncertainty ribbon across parameter sets
+  geom_ribbon(
+    data = summary_curve,
+    aes(x = vax_cov_med * 100,
+        ymin = coinf_lo,
+        ymax = coinf_hi),
+    fill  = "forestgreen",
+    alpha = 0.2
+  ) +
+  # Median curve across parameter sets
+  geom_line(
+    data = summary_curve,
+    aes(x = vax_cov_med * 100,
+        y  = coinf_med),
+    color = "forestgreen",
+    size  = 1.1
+  ) +
+  # # Baseline deterministic curve
+  # geom_line(
+  #   data = baseline_curve,
+  #   aes(x = vax_coverage * 100,
+  #       y  = coinfection),
+  #   color    = "black",
+  #   linetype = "dashed",
+  #   size     = 1
+  # ) +
+  labs(
+    x = "Vaccination coverage of worker population (%)",
+    y = "Total H1+H5 coinfections over season",
+    title    = "Impact of seasonal influenza vaccination on H1+H5 coinfections",
+    subtitle = "Green line = median over parameter uncertainty; shaded area = 95% interval"
+  ) +
+  theme_minimal(base_size = 14)
+
+## 6.8 Plot: vaccination coverage vs coinfection burden -----------------------
+
+policy_curve <- baseline_curve %>%
+  mutate(
+    vax_cov_pct     = vax_coverage * 100,
+    coinf_per_1000  = coinfection / (PopSize / 1000),
+    p_at_least_one  = 1 - exp(-coinfection)   # Poisson(λ = expected count)
+  )
+
+
+ggplot(policy_curve, aes(x = vax_cov_pct, y = coinfection)) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "Vaccination coverage of worker population (%)",
+    y = "Expected number of H1+H5 co-infections per season",
+    title = "Impact of seasonal influenza vaccination on expected H1+H5 co-infections"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+ggplot(policy_curve, aes(x = vax_cov_pct, y = p_at_least_one)) +
+  geom_line(size = 1.2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Vaccination coverage of worker population (%)",
+    y = "Probability of ≥1 H1+H5 co-infected worker in a season",
+    title = "Seasonal probability of at least one H1+H5 co-infection"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+# Helper: find row closest to a target coverage
+get_scenario <- function(target_cov_pct, df) {
+  df %>%
+    dplyr::slice(which.min(abs(vax_cov_pct - target_cov_pct))) %>%
+    dplyr::mutate(target_cov_pct = target_cov_pct)
+}
+
+scenario_covs <- c(10, 80)  # example: 20% vs 60%
+
+policy_summary <- purrr::map_dfr(scenario_covs, get_scenario, df = policy_curve) %>%
+  dplyr::select(
+    target_cov_pct,
+    vax_cov_pct,
+    coinfection,
+    coinf_per_1000,
+    p_at_least_one
+  ) %>%
+  dplyr::mutate(
+    p_at_least_one_pct = 100 * p_at_least_one
+  )
+
+policy_summary
+
+
+
+##################################################################################################
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+
+# ------------------------------------------------------------------
+# User-set constants
+# ------------------------------------------------------------------
+PopSize <- 10000
+facility_size <- 50   # operational unit for inset (50-worker facility)
+
+# ------------------------------------------------------------------
+# Prep data for plotting (convert to per-1,000 workers for main panel)
+# ------------------------------------------------------------------
+plot_curve <- summary_curve %>%
+  transmute(
+    cov_pct  = 100 * vax_cov_med,
+    y_med    = coinf_med / (PopSize/1000),   # per 1,000 workers
+    y_lo     = coinf_lo  / (PopSize/1000),
+    y_hi     = coinf_hi  / (PopSize/1000)
+  ) %>%
+  arrange(cov_pct)
+
+scenario_targets <- tibble(cov_pct = c(10, 80))
+
+scenario_seg <- scenario_targets %>%
+  mutate(
+    y_med = approx(plot_curve$cov_pct, plot_curve$y_med, xout = cov_pct)$y,
+    y_lo  = approx(plot_curve$cov_pct, plot_curve$y_lo,  xout = cov_pct)$y,
+    y_hi  = approx(plot_curve$cov_pct, plot_curve$y_hi,  xout = cov_pct)$y,
+    scn   = c("A", "B")
+  )
+
+
+# Narrative anchors (reduce clutter)
+policy_targets <- c(10, 50, 80)
+policy_pts <- bind_rows(lapply(policy_targets, function(tgt) {
+  plot_curve %>%
+    slice(which.min(abs(cov_pct - tgt))) %>%
+    mutate(target_cov = tgt)
+}))
+
+# Annotation: emphasize 10% -> 80%
+cov_a <- 10
+cov_b <- 80
+pt_a <- plot_curve %>% slice(which.min(abs(cov_pct - cov_a)))
+pt_b <- plot_curve %>% slice(which.min(abs(cov_pct - cov_b)))
+
+abs_drop <- pt_a$y_med - pt_b$y_med
+rel_drop <- abs_drop / pt_a$y_med
+
+ann_text <- sprintf(
+  "%d%% → %d%% coverage:\n~%.0f%% reduction in expected coinfections\n(~%.2f fewer per 1,000 workers)",
+  cov_a, cov_b, 100 * rel_drop, abs_drop
+)
+
+# Full-range x-axis for main-text clarity
+x_min <- 0
+x_max <- 100
+
+# ---- Choose y-zoom based on the curve, then add headroom ----
+y_focus <- max(plot_curve$y_med, na.rm = TRUE)
+y_zoom  <- max(0.5, 1.10 * y_focus)   # 10% headroom 
+
+# Optional: nicer y-axis breaks based on zoom
+y_break_by <- ifelse(y_zoom <= 2, 0.5, 1)
+
+# ------------------------------------------------------------------
+# Inset probability: convert per-1,000 burden to facility expected count
+# λ_facility = (coinfections per 1,000) * (facility_size / 1,000)
+# P(≥1) = 1 - exp(-λ)
+# ------------------------------------------------------------------
+prob_curve_fac <- plot_curve %>%
+  transmute(
+    cov_pct = cov_pct,
+    lam_med = y_med * (facility_size / 1000),
+    lam_lo  = y_lo  * (facility_size / 1000),
+    lam_hi  = y_hi  * (facility_size / 1000),
+    p_med   = 1 - exp(-lam_med),
+    p_lo    = 1 - exp(-lam_lo),
+    p_hi    = 1 - exp(-lam_hi)
+  )
+
+policy_prob_pts <- policy_pts %>%
+  transmute(
+    cov_pct = cov_pct,
+    lam_med = y_med * (facility_size / 1000),
+    p_med   = 1 - exp(-lam_med),
+    target_cov = target_cov
+  )
+
+
+
+# ------------------------------------------------------------------
+# Panel 1: Main curve (median + 95% interval; emphasize 10–80%)
+# ------------------------------------------------------------------
+
+# full-range panel (top) + zoomed panel (bottom)
+scenario_targets <- tibble(cov_pct = c(10, 80))
+
+scenario_seg <- scenario_targets %>%
+  mutate(
+    y_med = approx(plot_curve$cov_pct, plot_curve$y_med, xout = cov_pct, rule = 2)$y,
+    y_lo  = approx(plot_curve$cov_pct, plot_curve$y_lo,  xout = cov_pct, rule = 2)$y,
+    y_hi  = approx(plot_curve$cov_pct, plot_curve$y_hi,  xout = cov_pct, rule = 2)$y,
+    scn   = c("A", "B")
+  )
+
+pt_a <- scenario_seg %>% filter(cov_pct == 10)
+pt_b <- scenario_seg %>% filter(cov_pct == 80)
+
+abs_drop <- pt_a$y_med - pt_b$y_med
+rel_drop <- abs_drop / pt_a$y_med
+
+ann_text <- sprintf(
+  "%d%% → %d%% coverage:\n~%.0f%% reduction in expected coinfections\n(~%.2f fewer per 1,000 workers)",
+  10, 80, 100 * rel_drop, abs_drop
+)
+
+
+p_full <- ggplot(plot_curve, aes(x = cov_pct)) +
+  # 95% interval across parameter uncertainty
+  geom_ribbon(aes(ymin = y_lo, ymax = y_hi),
+              alpha = 0.15, fill = "tan") +
+  # median
+  geom_line(aes(y = y_med), linewidth = 1.2) +
+ 
+  # scenario comparison: 10% vs 80% (points + whiskers + dashed connector)
+  geom_segment(
+    data = scenario_seg,
+    aes(x = 10, xend = 80,
+        y = y_med[cov_pct == 10],
+        yend = y_med[cov_pct == 80]),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    linewidth = 0.7, 
+    color = "red"
+  ) +
+  geom_errorbar(
+    data = scenario_seg,
+    aes(x = cov_pct, ymin = y_lo, ymax = y_hi),
+    inherit.aes = FALSE,
+    width = 4,
+    linewidth = 0.7, 
+    color = "blue"
+  ) +
+  geom_point(
+    data = scenario_seg,
+    aes(x = cov_pct, y = y_med),
+    inherit.aes = FALSE,
+    size = 4, 
+    shape = 18,
+    color = "blue"
+  ) +
+  
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 10),
+    labels = \(x) paste0(x, "%")
+  ) +
+  labs(
+    x = "Final seasonal influenza vaccination coverage among dairy workers",
+    y = "Expected H1+H5 coinfections per 1,000 workers (per season)",
+    title = "Higher seasonal influenza vaccination coverage\nreduces H1+H5 coinfections among dairy workers",
+    subtitle = "Solid line: median across parameter uncertainty;\nshaded area: 95% interval"
+  ) +
+  theme_classic(base_size = 12)
+
+
+p_zoom <- p_full +
+  coord_cartesian(ylim = c(0, y_zoom*0.8)) + 
+  #    annotate(
+  #   "label",
+  #   x = 20,
+  #   y = y_zoom * 0.52,
+  #   label = ann_text,
+  #   hjust = 0,
+  #   size = 3.5,
+  #   label.size = 0.25
+  # ) +
+  labs(y = "Expected H1+H5 coinfections per 1,000 workers (per season)") 
+
+p_zoom
+
+
+# 1) Remove y-axis titles from both left panels (we'll add one shared label)
+p_full <- p_full + theme(axis.title.y = element_blank(), axis.title.x = element_blank())
+p_zoom <- p_zoom + theme(axis.title.y = element_blank(), title = element_blank())
+
+# Remove duplicated y tick labels from the TOP panel only
+# p_full <- p_full + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+# 2) Stack the left panels
+left_stack <- plot_grid(p_full, p_zoom, ncol = 1, align = "v", axis = "lr",
+                        rel_heights = c(1, 1))
+
+left_stack
+
+# 
+# # 3) Put the operational risk panel on the right
+# main_plus_inset <- plot_grid(left_stack, p_inset, ncol = 2, rel_widths = c(3.2, 1.4))
+# 
+# # 4) Add ONE shared y-axis label, centered across the left stack
+# final_fig <- ggdraw(main_plus_inset) +
+#   theme_classic()+
+#   theme(
+#     plot.margin = margin(t = 10, r = 10, b = 10, l = 40)  # <-- KEY LINE
+#   )
+# 
+# final_fig
+
+
+
+
+
+
+
+# ---- Fig 2: probability of ≥1 coinfected worker ----
+# Using Poisson approximation: P(>=1) = 1 - exp(-E[count])
+#### Alt: includes prob >= 1 H5 inf over season
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(patchwork)
+
+# ---- Main curve data (same as before) ----
+plot_curve <- summary_curve %>%
+  transmute(
+    cov_pct  = 100 * vax_cov_med,
+    y_med    = coinf_med,
+    y_lo     = coinf_lo,
+    y_hi     = coinf_hi
+  )
+
+plot_baseline <- baseline_curve %>%
+  transmute(
+    cov_pct = 100 * vax_coverage,
+    y      = coinfection
+  )
+
+# Policy markers (achieved coverage)
+policy_targets <- c(5, 25, 50, 80)
+policy_pts <- bind_rows(lapply(policy_targets, function(tgt) {
+  plot_curve %>%
+    slice(which.min(abs(cov_pct - tgt))) %>%
+    mutate(target_cov = tgt)
+}))
+
+# Takeaway annotation (20% -> 60%)
+cov_a <- 20; cov_b <- 60
+pt_a <- plot_curve %>% slice(which.min(abs(cov_pct - cov_a)))
+pt_b <- plot_curve %>% slice(which.min(abs(cov_pct - cov_b)))
+
+abs_drop <- (pt_a$y_med - pt_b$y_med)
+rel_drop <- abs_drop / pt_a$y_med
+
+ann_text <- sprintf(
+  "Increasing coverage from %d%% to %d%%\nreduces expected H1+H5 coinfections by ~%d (%.0f%%).",
+  cov_a, cov_b, round(abs_drop), 100 * rel_drop
+)
+
+ann_x <- 62
+ann_y <- max(plot_curve$y_hi, na.rm = TRUE) * 0.92
+
+# ---- Inset: probability of ≥1 coinfected worker ----
+# Using Poisson approximation: P(>=1) = 1 - exp(-E[count])
+prob_curve <- plot_curve %>%
+  transmute(
+    cov_pct = cov_pct,
+    p_med   = 1 - exp(-y_med),
+    p_lo    = 1 - exp(-y_lo),
+    p_hi    = 1 - exp(-y_hi)
+  )
+
+prob_baseline <- plot_baseline %>%
+  transmute(
+    cov_pct = cov_pct,
+    p       = 1 - exp(-y)
+  )
+
+policy_prob_pts <- policy_pts %>%
+  transmute(
+    cov_pct = cov_pct,
+    p_med   = 1 - exp(-y_med),
+    target_cov = target_cov
+  )
+
+# ---- MAIN PANEL ----
+p_main <- ggplot() +
+  geom_ribbon(
+    data = plot_curve,
+    aes(x = cov_pct, ymin = y_lo, ymax = y_hi),
+    alpha = 0.18
+  ) +
+  geom_line(
+    data = plot_curve,
+    aes(x = cov_pct, y = y_med),
+    linewidth = 1.2
+  ) +
+  geom_line(
+    data = plot_baseline,
+    aes(x = cov_pct, y = y),
+    linetype = "dashed",
+    linewidth = 0.9
+  ) +
+  geom_point(
+    data = policy_pts,
+    aes(x = cov_pct, y = y_med),
+    size = 2.7
+  ) +
+  geom_text(
+    data = policy_pts,
+    aes(x = cov_pct, y = y_med, label = paste0(target_cov, "%")),
+    vjust = -0.9,
+    size = 3.6
+  ) +
+  annotate(
+    "label",
+    x = ann_x, y = ann_y,
+    label = ann_text,
+    hjust = 0,
+    size = 3.4,
+    label.size = 0.25
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 20),
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(n = 6),
+    expand = expansion(mult = c(0, 0.06))
+  ) +
+  labs(
+    x = "Final seasonal influenza vaccination coverage among dairy workers",
+    y = "Expected number of H1+H5 coinfections per season",
+    title = "Higher seasonal influenza vaccination coverage reduces H1+H5 coinfections",
+    subtitle = "Solid line: median across parameter uncertainty; shaded area: 95% interval; dashed line: baseline parameter set"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# ---- INSET PANEL ----
+p_inset <- ggplot() +
+  geom_ribbon(
+    data = prob_curve,
+    aes(x = cov_pct, ymin = p_lo, ymax = p_hi),
+    alpha = 0.18
+  ) +
+  geom_line(
+    data = prob_curve,
+    aes(x = cov_pct, y = p_med),
+    linewidth = 0.9
+  ) +
+  geom_line(
+    data = prob_baseline,
+    aes(x = cov_pct, y = p),
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+  geom_point(
+    data = policy_prob_pts,
+    aes(x = cov_pct, y = p_med),
+    size = 1.8
+  ) +
+  scale_x_continuous(
+    limits = c(0, 100),
+    breaks = c(0, 50, 100),
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    breaks = pretty_breaks(n = 4),
+    expand = expansion(mult = c(0.05, 0.08))
+  ) +
+  labs(
+    x = NULL,
+    y = NULL,
+    title = "Probability of ≥1 coinfected worker\n(Poisson approximation)"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    plot.title = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+# ---- COMBINE: inset placed to the right (cleanest for journals) ----
+(p_main + p_inset) +
+  plot_layout(widths = c(3.2, 1.35))
+
+
+
+
+
+
+
+
+
+
+
+
+###############################################################################################################
+
+
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# targets as proportions (NOT percent)
+cov_targets <- c(0.05, 0.10, 0.25, 0.50, 0.60, 0.80)
+
+# Make sure baseline_curve is sorted by coverage before inverting
+bc <- baseline_curve %>% arrange(vax_coverage)
+
+# Interpolate nu that achieves each target coverage
+nu_targets <- approx(
+  x    = bc$vax_coverage,
+  y    = bc$nu,
+  xout = cov_targets,
+  rule = 2
+)$y
+
+scenario_map <- tibble(
+  cov_target = cov_targets,
+  cov_label  = paste0(round(100 * cov_targets), "%"),
+  nu         = nu_targets
+)
+
+
+
+library(deSolve)
+library(purrr)
+
+sim_prob_list <- purrr::pmap(
+  list(scenario_map$nu, scenario_map$cov_label),
+  function(nu_val, cov_lab) {
+    
+    params <- base_params
+    params$nu <- nu_val
+    
+    out <- ode(
+      y     = x0,
+      times = times,
+      func  = SLIR_two_virus_vax,
+      parms = params
+    )
+    
+    as.data.frame(out) %>%
+      transmute(
+        time = time,
+        cov_label = cov_lab,
+        nu = nu_val,
+        # Poisson approximation for whole population:
+        p_ge1 = 1 - exp(-C_coinfection)
+      )
+  }
+)
+
+prob_time_df <- bind_rows(sim_prob_list) %>%
+  mutate(cov_label = factor(cov_label, levels = paste0(round(100 * cov_targets), "%")))
+
+
+
+ggplot(prob_time_df, aes(x = time, y = p_ge1, group = cov_label, linetype = cov_label)) +
+  geom_line(linewidth = 1.0) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    x = "Time (days)",
+    y = "Probability of ≥1 H1+H5 coinfected worker in population (Poisson approximation)",
+    linetype = "End-of-season\nvaccination coverage",
+    title = "Population-level risk of at least one H1+H5 coinfection over time",
+    subtitle = "Lines correspond to scenarios chosen to achieve target final vaccination coverages"
+  ) +
+  theme_classic(base_size = 12)
+
+
+
+###############################################################################################################
+
+
+
+library(dplyr)
+library(purrr)
+library(deSolve)
+library(ggplot2)
+library(scales)
+library(furrr)
+library(future)
+
+# ------------------------------------------------------------
+# 1) Choose target end-of-season coverages and map to nu
+#    (using your existing baseline_curve mapping nu -> vax_coverage)
+# ------------------------------------------------------------
+cov_targets <- c(0.05, 0.10, 0.25, 0.50, 0.60, 0.80)
+
+bc <- baseline_curve %>% arrange(vax_coverage)
+
+nu_targets <- approx(
+  x    = bc$vax_coverage,
+  y    = bc$nu,
+  xout = cov_targets,
+  rule = 2
+)$y
+
+scenario_map <- tibble(
+  cov_target = cov_targets,
+  cov_label  = paste0(round(100 * cov_targets), "%"),
+  nu         = nu_targets
+) %>%
+  mutate(cov_label = factor(cov_label, levels = cov_label))
+
+# ------------------------------------------------------------
+# 2) Helper: run one parameter set across scenarios, return p_ge1(t)
+# ------------------------------------------------------------
+run_one_paramset <- function(j, lhs_params_curve, scenario_map, base_params, x0, times) {
+  
+  # plug LHS parameters into base_params (excluding nu; nu set per scenario)
+  params_j <- base_params
+  params_j[names(lhs_params_curve[j, ])] <- as.list(lhs_params_curve[j, ])
+  
+  # run each coverage scenario
+  out_list <- lapply(seq_len(nrow(scenario_map)), function(k) {
+    
+    params_j$nu <- scenario_map$nu[k]
+    
+    sim <- ode(
+      y     = x0,
+      times = times,
+      func  = SLIR_two_virus_vax,
+      parms = params_j
+    )
+    
+    as.data.frame(sim) %>%
+      transmute(
+        sample_id = j,
+        cov_label = scenario_map$cov_label[k],
+        time      = time,
+        # Poisson approximation for ENTIRE population:
+        p_ge1     = 1 - exp(-C_coinfection)
+      )
+  })
+  
+  bind_rows(out_list)
+}
+
+# ------------------------------------------------------------
+# 3) Run across LHS parameter sets in parallel
+# ------------------------------------------------------------
+plan(multisession)
+
+n_sets <- nrow(lhs_params_curve)  # e.g., 150 in your curve uncertainty section
+
+prob_time_all <- furrr::future_map_dfr(
+  seq_len(n_sets),
+  run_one_paramset,
+  lhs_params_curve = lhs_params_curve,
+  scenario_map     = scenario_map,
+  base_params      = base_params,
+  x0               = x0,
+  times            = times,
+  .options = furrr::furrr_options(seed = TRUE)
+)
+
+# ------------------------------------------------------------
+# 4) Summarize uncertainty bands over parameter sets
+# ------------------------------------------------------------
+prob_time_sum <- prob_time_all %>%
+  group_by(cov_label, time) %>%
+  summarise(
+    p_med = median(p_ge1, na.rm = TRUE),
+    p_lo  = quantile(p_ge1, 0.025, na.rm = TRUE),
+    p_hi  = quantile(p_ge1, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 5) Plot: median + 95% interval over time, by scenario
+# ------------------------------------------------------------
+ggplot(prob_time_sum, aes(x = time, y = p_med, group = cov_label)) +
+  geom_ribbon(aes(ymin = p_lo, ymax = p_hi), alpha = 0.12) +
+  geom_line(linewidth = 1.0) +
+  facet_wrap(~ cov_label, ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    x = "Time (days)",
+    y = "P(≥1 H1+H5 coinfected worker in population)\n(Poisson approximation)",
+    title = "Population risk of at least one H1+H5 coinfection over time",
+    subtitle = "Lines show median; shaded areas show 95% interval across parameter sets"
+  ) +
+  theme_classic(base_size = 12)
